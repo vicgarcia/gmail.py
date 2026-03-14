@@ -25,12 +25,12 @@ SMTP_PORT = 465
 
 CLI_EPILOG = '''\
 Examples:
-  email.py send --to "friend@example.com" --subject "Hello" --body "How are you?"
-  email.py send --to "team@work.com" --subject "Update" --html "<h1>Status</h1><p>All good</p>"
-  email.py send --to "boss@work.com" --subject "Report" --body "See attached" --attach report.pdf
-  email.py send --to "a@ex.com,b@ex.com" --cc "c@ex.com" --subject "FYI" --body "Info"
-  email.py send --to "user@ex.com" --subject "Doc" --body-file message.txt --attach doc.pdf
-  email.py send --to "user@ex.com" --subject "Newsletter" --body "Plain text fallback" --html-file newsletter.html
+  gmail.py send --to "friend@example.com" --subject "Hello" --body "How are you?"
+  gmail.py send --to "team@work.com" --subject "Update" --html "<h1>Status</h1><p>All good</p>"
+  gmail.py send --to "boss@work.com" --subject "Report" --body "See attached" --attach report.pdf
+  gmail.py send --to "a@ex.com,b@ex.com" --cc "c@ex.com" --subject "FYI" --body "Info"
+  gmail.py send --to "user@ex.com" --subject "Doc" --body-file message.txt --attach doc.pdf
+  gmail.py send --to "user@ex.com" --subject "Newsletter" --body "Plain text fallback" --html-file newsletter.html
 
 Setup:
   1. Enable 2-Step Verification on your Google account

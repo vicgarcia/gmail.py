@@ -1,4 +1,4 @@
-# email.py
+# gmail.py
 
 A simple CLI for sending emails via Gmail SMTP.
 
@@ -32,16 +32,16 @@ Gmail requires an App Password (not your regular password) for SMTP access:
 
 ```bash
 # Clone and make executable
-git clone https://github.com/vicgarcia/email.py.git
-cd email.py
-chmod +x email.py
+git clone https://github.com/vicgarcia/gmail.py.git
+cd gmail.py
+chmod +x gmail.py
 
 # Run
-./email.py --help
+./gmail.py --help
 
 # Install
-cp email.py ~/.local/bin
-chmod +x ~/.local/bin/email.py
+cp gmail.py ~/.local/bin
+chmod +x ~/.local/bin/gmail.py
 
 # Set credentials
 export GMAIL_USER="you@gmail.com"
@@ -67,19 +67,19 @@ Or pass them as arguments: `--user` and `--password`
 ### Send Plain Text Email
 
 ```bash
-email.py send --to "friend@example.com" --subject "Hello" --body "How are you?"
+gmail.py send --to "friend@example.com" --subject "Hello" --body "How are you?"
 ```
 
 ### Send HTML Email
 
 ```bash
-email.py send --to "team@work.com" --subject "Update" --html "<h1>Status</h1><p>All systems operational.</p>"
+gmail.py send --to "team@work.com" --subject "Update" --html "<h1>Status</h1><p>All systems operational.</p>"
 ```
 
 ### Send Multipart Email (Text + HTML)
 
 ```bash
-email.py send --to "user@example.com" --subject "Newsletter" \
+gmail.py send --to "user@example.com" --subject "Newsletter" \
   --body "Plain text for email clients that don't support HTML" \
   --html "<h1>Newsletter</h1><p>Rich HTML version</p>"
 ```
@@ -87,12 +87,12 @@ email.py send --to "user@example.com" --subject "Newsletter" \
 ### Send with Attachments
 
 ```bash
-email.py send --to "boss@work.com" --subject "Report" \
+gmail.py send --to "boss@work.com" --subject "Report" \
   --body "Please see the attached report." \
   --attach report.pdf
 
 # Multiple attachments
-email.py send --to "team@work.com" --subject "Files" \
+gmail.py send --to "team@work.com" --subject "Files" \
   --body "Here are the files." \
   --attach document.pdf --attach data.csv --attach image.png
 ```
@@ -101,13 +101,13 @@ email.py send --to "team@work.com" --subject "Files" \
 
 ```bash
 # Text body from file
-email.py send --to "user@example.com" --subject "Message" --body-file message.txt
+gmail.py send --to "user@example.com" --subject "Message" --body-file message.txt
 
 # HTML body from file
-email.py send --to "user@example.com" --subject "Newsletter" --html-file newsletter.html
+gmail.py send --to "user@example.com" --subject "Newsletter" --html-file newsletter.html
 
 # Both from files
-email.py send --to "user@example.com" --subject "Update" \
+gmail.py send --to "user@example.com" --subject "Update" \
   --body-file plain.txt --html-file rich.html
 ```
 
@@ -115,10 +115,10 @@ email.py send --to "user@example.com" --subject "Update" \
 
 ```bash
 # Multiple To recipients
-email.py send --to "a@example.com,b@example.com" --subject "FYI" --body "Info for all"
+gmail.py send --to "a@example.com,b@example.com" --subject "FYI" --body "Info for all"
 
 # With CC and BCC
-email.py send --to "primary@example.com" \
+gmail.py send --to "primary@example.com" \
   --cc "copy1@example.com,copy2@example.com" \
   --bcc "hidden@example.com" \
   --subject "Update" --body "Message content"
@@ -127,7 +127,7 @@ email.py send --to "primary@example.com" \
 ### Dry Run (Preview)
 
 ```bash
-email.py send --to "test@example.com" --subject "Test" --body "Hello" --dry-run
+gmail.py send --to "test@example.com" --subject "Test" --body "Hello" --dry-run
 ```
 
 ## Send Command Options
@@ -167,9 +167,9 @@ This project includes a `SKILL.md` file for use with AI coding agents (Claude Co
 mkdir -p /path/to/agent/skills
 
 # Copy SKILL.md
-cp /path/to/email.py/SKILL.md /path/to/agent/skills/email/SKILL.md
+cp /path/to/gmail.py/SKILL.md /path/to/agent/skills/email/SKILL.md
 
-# Ensure email.py is in PATH (see installation above)
+# Ensure gmail.py is in PATH (see installation above)
 
 # Set credentials (in bashrc, zshrc, ...)
 export GMAIL_USER="you@gmail.com"
