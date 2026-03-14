@@ -167,7 +167,7 @@ This project includes a `SKILL.md` file for use with AI coding agents (Claude Co
 mkdir -p /path/to/agent/skills
 
 # Copy SKILL.md
-cp /path/to/gmail.py/SKILL.md /path/to/agent/skills/email/SKILL.md
+cp /path/to/gmail.py/SKILL.md /path/to/agent/skills/gmail.py/SKILL.md
 
 # Ensure gmail.py is in PATH (see installation above)
 
