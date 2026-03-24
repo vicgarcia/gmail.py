@@ -1,5 +1,5 @@
 ---
-name: gmail.py
+name: gmail
 description: Send emails via Gmail SMTP. Use when the user wants to send an email, compose a message, share files via email, or notify someone by email. Supports plain text, HTML, attachments, and multiple recipients.
 compatibility: Requires 'gmail.py' script in PATH with GMAIL_USER and GMAIL_APP_PASSWORD environment variables set.
 ---
