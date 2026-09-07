@@ -65,6 +65,9 @@ Examples:
   gmail.py inbox --limit 10 --unread
   gmail.py search --raw "from:bob has:attachment newer_than:7d"
   gmail.py search --from "bob@example.com" --since 2026-09-01 --folder all
+  gmail.py read 4821
+  gmail.py read 4821 --full --save-attachments ./downloads
+  gmail.py thread 4821
 
 Setup:
   1. Enable 2-Step Verification on your Google account
@@ -681,6 +684,36 @@ class GmailClient:
             uids = uids[:limit]
         return self._fetch_summaries(uids)
 
+    def fetch(self, uid: int, folder: str = "inbox") -> dict:
+        '''Fetch one message by UID from a folder.'''
+        self._select(folder, readonly=True)
+        messages = self._fetch_summaries([uid])
+        if not messages:
+            raise GmailError(f"No message with UID {uid} in folder {folder!r}")
+        messages[0]["folder"] = folder
+        return messages[0]
+
+    def thread(self, uid: int, folder: str = "inbox") -> list[dict]:
+        '''Return the full conversation for a UID, oldest first.
+
+        The search runs against All Mail on purpose: your own replies live in
+        Sent, so anything narrower cannot show both sides of a conversation.
+        '''
+        base = self.fetch(uid, folder)
+        if not base["thrid"]:
+            return [base]
+        self._select("all", readonly=True)
+        conn = self._imap()
+        typ, data = conn.uid("SEARCH", None, "X-GM-THRID", base["thrid"])
+        if typ != "OK":
+            raise GmailError(f"Thread search failed: {imap_response_text(data)}")
+        uids = sorted(int(u) for u in (data[0] or b"").split())
+        messages = self._fetch_summaries(uids)
+        # UIDs are per-folder: these are All Mail UIDs, so say so
+        for message in messages:
+            message["folder"] = "all"
+        return messages or [base]
+
     def close(self) -> None:
         '''Log out of IMAP if connected.'''
         conn, self._imap_conn = self._imap_conn, None
@@ -801,6 +834,49 @@ def cmd_send(client: GmailClient, args: argparse.Namespace) -> int:
     return 0
 
 
+def save_attachments(msg, directory: Path) -> list[Path]:
+    '''Write a message's attachments into a directory and return the paths.'''
+    directory.mkdir(parents=True, exist_ok=True)
+    saved = []
+    if not msg.is_multipart():
+        return saved
+    for index, part in enumerate(msg.walk(), start=1):
+        if part.get_content_maintype() == "multipart" or not is_attachment(part):
+            continue
+        name = decode_header_value(part.get_filename()) or f"attachment-{index}"
+        # Never let a message name a path outside the target directory
+        name = Path(name.replace("\\", "/")).name or f"attachment-{index}"
+        target = directory / name
+        counter = 1
+        while target.exists():
+            target = directory / f"{Path(name).stem}-{counter}{Path(name).suffix}"
+            counter += 1
+        target.write_bytes(part.get_payload(decode=True) or b"")
+        saved.append(target)
+    return saved
+
+
+def wrap_body(text: str, indent: str = "  ") -> str:
+    '''Wrap body text to the display width, preserving paragraph breaks.'''
+    lines = []
+    for line in text.splitlines():
+        if not line.strip():
+            # Collapse runs of blank lines; mail bodies are full of them
+            if lines and lines[-1] == "":
+                continue
+            lines.append("")
+        else:
+            lines.append(textwrap.fill(
+                line, width=len(indent) + WRAP_WIDTH,
+                initial_indent=indent, subsequent_indent=indent,
+            ))
+    while lines and lines[0] == "":
+        lines.pop(0)
+    while lines and lines[-1] == "":
+        lines.pop()
+    return "\n".join(lines)
+
+
 def render_list(messages: list[dict]) -> None:
     '''Print message summaries as an aligned table with body snippets.'''
     rows = []
@@ -878,6 +954,84 @@ def cmd_search(client: GmailClient, args: argparse.Namespace) -> int:
         print("No messages found")
         return 0
     render_list(messages)
+    return 0
+
+
+def render_message(message: dict, full: bool = False) -> None:
+    '''Print a single message as a detail view.'''
+    print(message["subject"])
+    print()
+
+    fields = [
+        ("From", message["from_full"]),
+        ("To", message["to"]),
+        ("Cc", message["cc"]),
+        ("Date", format_date(message["date_raw"], "%a %b %d %Y %H:%M")),
+        ("Folder", message.get("folder") or ""),
+        ("Status", "read" if message["seen"] else "unread"),
+    ]
+    label_w = max(len(f[0]) for f in fields)
+    for label, value in fields:
+        if value:
+            print(f"  {label:<{label_w}}  {value}")
+
+    body = message_text(message["message"])
+    if body.strip():
+        print()
+        if not full and len(body) > BODY_TRUNCATE:
+            remaining = len(body) - BODY_TRUNCATE
+            body = body[:BODY_TRUNCATE]
+            print(wrap_body(body))
+            print()
+            print(f"  ... ({remaining} more characters, use --full to see all)")
+        else:
+            print(wrap_body(body))
+
+    if message["attachments"]:
+        print()
+        print("  Attachments")
+        name_w = max(len(a["filename"]) for a in message["attachments"])
+        for a in message["attachments"]:
+            print(f"    {a['filename']:<{name_w}}  {format_size(a['size'])}  {a['content_type']}")
+
+    print()
+    print(f"  UID: {message['uid']}")
+
+
+def cmd_read(client: GmailClient, args: argparse.Namespace) -> int:
+    '''Read a single message.'''
+    message = client.fetch(args.uid, folder=args.folder)
+
+    if args.html:
+        text, html = extract_bodies(message["message"])
+        if not html.strip():
+            print("No HTML body in this message", file=sys.stderr)
+            return 1
+        print(html)
+        return 0
+
+    render_message(message, full=args.full)
+
+    if args.save_attachments:
+        saved = save_attachments(message["message"], Path(args.save_attachments))
+        print()
+        if saved:
+            for path in saved:
+                print(f"  Saved: {path}")
+        else:
+            print("  No attachments to save")
+    return 0
+
+
+def cmd_thread(client: GmailClient, args: argparse.Namespace) -> int:
+    '''Show a conversation, oldest first.'''
+    messages = client.thread(args.uid, folder=args.folder)
+
+    print(f"{messages[0]['subject']} — {len(messages)} message(s)")
+    for message in messages:
+        print()
+        print("-" * (2 + WRAP_WIDTH))
+        render_message(message, full=args.full)
     return 0
 
 
@@ -1006,6 +1160,44 @@ def main() -> int:
         help="Maximum number of messages (default: 20)"
     )
 
+    # Read command
+    read_parser = subparsers.add_parser("read", help="Read a single message by UID")
+    read_parser.add_argument("uid", type=int, help="Message UID (from inbox or search)")
+    read_parser.add_argument(
+        "--folder",
+        default="inbox",
+        help=f"Folder holding the message: {', '.join(FOLDER_ALIASES)} (default: inbox)"
+    )
+    read_parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Show the full body without truncation"
+    )
+    read_parser.add_argument(
+        "--html",
+        action="store_true",
+        help="Dump the raw HTML body"
+    )
+    read_parser.add_argument(
+        "--save-attachments",
+        metavar="DIR",
+        help="Save attachments to a directory"
+    )
+
+    # Thread command
+    thread_parser = subparsers.add_parser("thread", help="Show a conversation by UID")
+    thread_parser.add_argument("uid", type=int, help="Message UID (from inbox or search)")
+    thread_parser.add_argument(
+        "--folder",
+        default="inbox",
+        help=f"Folder holding the message: {', '.join(FOLDER_ALIASES)} (default: inbox)"
+    )
+    thread_parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Show full bodies without truncation"
+    )
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1032,6 +1224,8 @@ def main() -> int:
         "send": cmd_send,
         "inbox": cmd_inbox,
         "search": cmd_search,
+        "read": cmd_read,
+        "thread": cmd_thread,
     }
     handler = commands.get(args.command)
     if handler is None:
