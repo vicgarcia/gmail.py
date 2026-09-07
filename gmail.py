@@ -70,6 +70,8 @@ Examples:
   gmail.py thread 4821
   gmail.py mark 4821 --read
   gmail.py mark 4821 --archive
+  gmail.py reply 4821 --body "Sounds good, shipping today." --quote
+  gmail.py reply 4821 --all --body "Adding the team." --dry-run
 
 Setup:
   1. Enable 2-Step Verification on your Google account
@@ -491,6 +493,7 @@ class GmailClient:
         bcc: list[str] | None = None,
         attachments: list[Path] | None = None,
         dry_run: bool = False,
+        extra_headers: dict | None = None,
     ) -> dict:
         '''Send an email via Gmail SMTP.'''
 
@@ -529,6 +532,11 @@ class GmailClient:
         msg["To"] = ", ".join(to)
         if cc:
             msg["Cc"] = ", ".join(cc)
+
+        # Threading headers for replies (In-Reply-To, References)
+        for header, value in (extra_headers or {}).items():
+            if value:
+                msg[header] = value
 
         # Build recipient list (To + Cc + Bcc)
         all_recipients = list(to)
@@ -836,6 +844,80 @@ def parse_recipients(value: str) -> list[str]:
     return [r.strip() for r in value.split(",") if r.strip()]
 
 
+def reply_subject(subject: str) -> str:
+    '''Prefix a subject with Re:, unless it already carries one.'''
+    value = (subject or "").strip()
+    if value.lower().startswith("re:"):
+        return value
+    return f"Re: {value}" if value else "Re:"
+
+
+def reply_recipients(msg, user: str, reply_all: bool = False) -> tuple[list[str], list[str]]:
+    '''Derive To and Cc for a reply: Reply-To wins over From.'''
+    to = address_list(msg.get("Reply-To")) or address_list(msg.get("From"))
+    cc: list[str] = []
+
+    def seen(addresses, candidate):
+        return candidate.lower() in {a.lower() for a in addresses}
+
+    if reply_all:
+        for address in address_list(msg.get("To")):
+            if address.lower() != user.lower() and not seen(to, address):
+                to.append(address)
+        for address in address_list(msg.get("Cc")):
+            if address.lower() != user.lower() and not seen(to, address) and not seen(cc, address):
+                cc.append(address)
+    return to, cc
+
+
+def reply_headers(msg) -> dict:
+    '''Build the threading headers that tie a reply to its original.'''
+    message_id = (msg.get("Message-ID") or "").strip()
+    if not message_id:
+        return {}
+    references = " ".join((msg.get("References") or "").split())
+    return {
+        "In-Reply-To": message_id,
+        "References": f"{references} {message_id}".strip(),
+    }
+
+
+def quote_original(msg) -> str:
+    '''Build an attribution line and quoted copy of the original body.'''
+    when = format_date(msg.get("Date"), "%a, %b %d, %Y at %H:%M")
+    sender = format_address(msg.get("From")) or "the sender"
+    attribution = f"On {when}, {sender} wrote:" if when else f"{sender} wrote:"
+    quoted = "\n".join("> " + line if line else ">" for line in message_text(msg).splitlines())
+    return f"{attribution}\n{quoted}"
+
+
+def load_bodies(args: argparse.Namespace) -> tuple[str | None, str | None]:
+    '''Resolve --body/--body-file/--html/--html-file into body content.'''
+    body_text = None
+    body_html = None
+
+    if args.body:
+        body_text = args.body
+    elif args.body_file:
+        body_file = Path(args.body_file)
+        if not body_file.exists():
+            raise GmailError(f"Body file not found: {body_file}")
+        body_text = body_file.read_text()
+
+    if args.html:
+        body_html = args.html
+    elif args.html_file:
+        html_file = Path(args.html_file)
+        if not html_file.exists():
+            raise GmailError(f"HTML file not found: {html_file}")
+        body_html = html_file.read_text()
+
+    if not body_text and not body_html:
+        raise GmailError("Must provide --body, --body-file, --html, or --html-file")
+
+    return body_text, body_html
+
+
 def cmd_send(client: GmailClient, args: argparse.Namespace) -> int:
     '''Send an email.'''
 
@@ -845,31 +927,7 @@ def cmd_send(client: GmailClient, args: argparse.Namespace) -> int:
     bcc = parse_recipients(args.bcc) if args.bcc else None
 
     # Get body content
-    body_text = None
-    body_html = None
-
-    if args.body:
-        body_text = args.body
-    elif args.body_file:
-        body_file = Path(args.body_file)
-        if not body_file.exists():
-            print(f"Error: Body file not found: {body_file}")
-            return 1
-        body_text = body_file.read_text()
-
-    if args.html:
-        body_html = args.html
-    elif args.html_file:
-        html_file = Path(args.html_file)
-        if not html_file.exists():
-            print(f"Error: HTML file not found: {html_file}")
-            return 1
-        body_html = html_file.read_text()
-
-    # Must have at least some content
-    if not body_text and not body_html:
-        print("Error: Must provide --body, --body-file, --html, or --html-file")
-        return 1
+    body_text, body_html = load_bodies(args)
 
     # Parse attachments
     attachments = None
@@ -877,23 +935,24 @@ def cmd_send(client: GmailClient, args: argparse.Namespace) -> int:
         attachments = [Path(a) for a in args.attach]
 
     # Send it
-    try:
-        result = client.send(
-            to=to,
-            subject=args.subject,
-            body_text=body_text,
-            body_html=body_html,
-            cc=cc,
-            bcc=bcc,
-            attachments=attachments,
-            dry_run=args.dry_run,
-        )
-    except GmailError as e:
-        print(f"Error: {e}")
-        return 1
+    result = client.send(
+        to=to,
+        subject=args.subject,
+        body_text=body_text,
+        body_html=body_html,
+        cc=cc,
+        bcc=bcc,
+        attachments=attachments,
+        dry_run=args.dry_run,
+    )
 
-    # Output
-    if args.dry_run:
+    render_send_result(result, args.dry_run)
+    return 0
+
+
+def render_send_result(result: dict, dry_run: bool) -> None:
+    '''Print the outcome of a send, previewed or actual.'''
+    if dry_run:
         print("DRY RUN - Email not sent")
         print("=" * 60)
         print(f"  From:        {result['from']}")
@@ -928,8 +987,6 @@ def cmd_send(client: GmailClient, args: argparse.Namespace) -> int:
         print(f"  Subject:     {result['subject']}")
         if result['attachments']:
             print(f"  Attachments: {', '.join(result['attachments'])}")
-
-    return 0
 
 
 def save_attachments(msg, directory: Path) -> list[Path]:
@@ -1181,6 +1238,46 @@ def cmd_mark(client: GmailClient, args: argparse.Namespace) -> int:
             return 1
     return 0
 
+def cmd_reply(client: GmailClient, args: argparse.Namespace) -> int:
+    '''Reply to a message, preserving its thread.'''
+    original = client.fetch(args.uid, folder=args.folder)
+    msg = original["message"]
+
+    to, cc = reply_recipients(msg, client.user, reply_all=args.all)
+    if not to:
+        print("Error: could not determine a reply recipient", file=sys.stderr)
+        return 1
+    if args.cc:
+        for address in parse_recipients(args.cc):
+            if address.lower() not in {a.lower() for a in cc}:
+                cc.append(address)
+    bcc = parse_recipients(args.bcc) if args.bcc else None
+
+    body_text, body_html = load_bodies(args)
+
+    if args.quote:
+        quoted = quote_original(msg)
+        body_text = f"{body_text}\n\n{quoted}" if body_text else quoted
+
+    attachments = [Path(a) for a in args.attach] if args.attach else None
+
+    result = client.send(
+        to=to,
+        subject=reply_subject(original["subject"]),
+        body_text=body_text,
+        body_html=body_html,
+        cc=cc or None,
+        bcc=bcc,
+        attachments=attachments,
+        dry_run=args.dry_run,
+        extra_headers=reply_headers(msg),
+    )
+
+    if not args.dry_run:
+        print(f"Replied to UID {args.uid}")
+    render_send_result(result, args.dry_run)
+    return 0
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(
@@ -1359,6 +1456,33 @@ def main() -> int:
     mark_group.add_argument("--archive", action="store_true", help="Archive (move out of the inbox)")
     mark_group.add_argument("--trash", action="store_true", help="Move to trash (destructive)")
 
+    # Reply command
+    reply_parser = subparsers.add_parser("reply", help="Reply to a message by UID")
+    reply_parser.add_argument("uid", type=int, help="Message UID (from inbox or search)")
+    reply_parser.add_argument(
+        "--folder",
+        default="inbox",
+        help=f"Folder holding the message: {', '.join(FOLDER_ALIASES)} (default: inbox)"
+    )
+    reply_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Reply to all original recipients"
+    )
+    reply_parser.add_argument(
+        "--quote",
+        action="store_true",
+        help="Quote the original message below the reply"
+    )
+    reply_parser.add_argument("--body", "-b", help="Plain text body")
+    reply_parser.add_argument("--body-file", help="Read plain text body from file")
+    reply_parser.add_argument("--html", help="HTML body")
+    reply_parser.add_argument("--html-file", help="Read HTML body from file")
+    reply_parser.add_argument("--cc", help="Additional CC recipient(s), comma-separated")
+    reply_parser.add_argument("--bcc", help="BCC recipient(s), comma-separated")
+    reply_parser.add_argument("--attach", "-a", action="append", help="File attachment (can be repeated)")
+    reply_parser.add_argument("--dry-run", action="store_true", help="Preview the reply without sending")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1388,6 +1512,7 @@ def main() -> int:
         "read": cmd_read,
         "thread": cmd_thread,
         "mark": cmd_mark,
+        "reply": cmd_reply,
     }
     handler = commands.get(args.command)
     if handler is None:
