@@ -62,6 +62,9 @@ Examples:
   gmail.py send --to "a@ex.com,b@ex.com" --cc "c@ex.com" --subject "FYI" --body "Info"
   gmail.py send --to "user@ex.com" --subject "Doc" --body-file message.txt --attach doc.pdf
   gmail.py send --to "user@ex.com" --subject "Newsletter" --body "Plain text fallback" --html-file newsletter.html
+  gmail.py inbox --limit 10 --unread
+  gmail.py search --raw "from:bob has:attachment newer_than:7d"
+  gmail.py search --from "bob@example.com" --since 2026-09-01 --folder all
 
 Setup:
   1. Enable 2-Step Verification on your Google account
@@ -258,7 +261,7 @@ def format_size(size: int) -> str:
 
 def quote_folder(name: str) -> str:
     '''Quote a mailbox name for SELECT; names with spaces fail unquoted.'''
-    return '"' + name.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return imap_quote(name)
 
 
 LIST_RE = re.compile(r'^\((?P<flags>[^)]*)\)\s+(?P<delim>"[^"]*"|NIL)\s+(?P<name>.*)$')
@@ -295,6 +298,120 @@ def folder_alias(name: str, flags_map: dict, names: list) -> str:
         f"Unknown folder {name!r} (use one of: {', '.join(FOLDER_ALIASES)}, "
         "or an exact mailbox name)"
     )
+
+
+FETCH_UID_RE = re.compile(rb"UID (\d+)")
+FETCH_FLAGS_RE = re.compile(rb"FLAGS \(([^)]*)\)")
+FETCH_THRID_RE = re.compile(rb"X-GM-THRID (\d+)")
+FETCH_MSGID_RE = re.compile(rb"X-GM-MSGID (\d+)")
+
+SUMMARY_ITEMS = "(UID FLAGS X-GM-THRID X-GM-MSGID BODY.PEEK[])"
+
+
+def imap_quote(value: str) -> str:
+    '''Quote a string as an IMAP quoted-string.'''
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def require_ascii(value: str, label: str) -> str:
+    '''IMAP command arguments are ASCII; fail loudly rather than silently.'''
+    try:
+        value.encode("ascii")
+    except UnicodeEncodeError:
+        raise GmailError(f"{label} must be ASCII (IMAP search does not accept non-ASCII terms)")
+    return value
+
+
+def imap_date(value: str) -> str:
+    '''Convert YYYY-MM-DD to the DD-Mon-YYYY form IMAP SEARCH expects.'''
+    try:
+        return datetime.strptime(value.strip(), "%Y-%m-%d").strftime("%d-%b-%Y")
+    except ValueError:
+        raise GmailError(f"Invalid date {value!r}, expected YYYY-MM-DD")
+
+
+def build_criteria(
+    sender: str | None = None,
+    to: str | None = None,
+    subject: str | None = None,
+    unread: bool = False,
+    since: str | None = None,
+    before: str | None = None,
+) -> list[str]:
+    '''Build IMAP SEARCH criteria from the structured search flags.'''
+    criteria: list[str] = []
+    if sender:
+        criteria += ["FROM", imap_quote(require_ascii(sender, "--from"))]
+    if to:
+        criteria += ["TO", imap_quote(require_ascii(to, "--to"))]
+    if subject:
+        criteria += ["SUBJECT", imap_quote(require_ascii(subject, "--subject"))]
+    if unread:
+        criteria.append("UNSEEN")
+    if since:
+        criteria += ["SINCE", imap_date(since)]
+    if before:
+        criteria += ["BEFORE", imap_date(before)]
+    return criteria or ["ALL"]
+
+
+def parse_fetch(data) -> list[dict]:
+    '''Parse a FETCH response into per-message dicts of metadata and raw bytes.'''
+    messages = []
+    for part in data or []:
+        if not isinstance(part, tuple) or len(part) < 2:
+            continue
+        meta, raw = part[0], part[1]
+        uid = FETCH_UID_RE.search(meta)
+        flags = FETCH_FLAGS_RE.search(meta)
+        thrid = FETCH_THRID_RE.search(meta)
+        msgid = FETCH_MSGID_RE.search(meta)
+        messages.append({
+            "uid": int(uid.group(1)) if uid else None,
+            "flags": flags.group(1).decode(errors="replace").split() if flags else [],
+            "thrid": thrid.group(1).decode() if thrid else None,
+            "msgid": msgid.group(1).decode() if msgid else None,
+            "raw": raw,
+        })
+    return messages
+
+
+def snippet_of(msg, width: int = 240) -> str:
+    '''One-line preview of a message body for list views.'''
+    text = " ".join(message_text(msg).split())
+    if len(text) > width:
+        text = text[:width].rstrip() + "..."
+    return text
+
+
+def summarize(entry: dict) -> dict:
+    '''Build a message summary dict from a parsed FETCH entry.'''
+    msg = BytesParser().parsebytes(entry["raw"])
+    return {
+        "uid": entry["uid"],
+        "thrid": entry["thrid"],
+        "msgid": entry["msgid"],
+        "flags": entry["flags"],
+        "seen": "\\Seen" in entry["flags"],
+        "date": format_date(msg.get("Date")),
+        "date_raw": msg.get("Date"),
+        "from": format_address(msg.get("From"), name_only=True),
+        "from_full": format_address(msg.get("From")),
+        "to": format_address(msg.get("To")),
+        "cc": format_address(msg.get("Cc")),
+        "subject": decode_header_value(msg.get("Subject")) or "(no subject)",
+        "message_id": (msg.get("Message-ID") or "").strip(),
+        "snippet": snippet_of(msg),
+        "attachments": list_attachments(msg),
+        "message": msg,
+    }
+
+
+def truncate(value: str, width: int) -> str:
+    '''Truncate a column value with an ellipsis.'''
+    if len(value) <= width:
+        return value
+    return value[:width - 3].rstrip() + "..."
 
 
 def imap_error_text(err: Exception) -> str:
@@ -524,6 +641,46 @@ class GmailClient:
             raise GmailError(f"Could not open folder {name!r}: {imap_response_text(data)}")
         return name
 
+    def _uid_search(self, criteria: list[str] | None, raw: str | None) -> list[int]:
+        '''Run a UID SEARCH and return matching UIDs, ascending.'''
+        conn = self._imap()
+        if raw:
+            args = ["X-GM-RAW", imap_quote(require_ascii(raw, "--raw"))]
+        else:
+            args = list(criteria or ["ALL"])
+        typ, data = conn.uid("SEARCH", None, *args)
+        if typ != "OK":
+            raise GmailError(f"Search failed: {imap_response_text(data)}")
+        return [int(uid) for uid in (data[0] or b"").split()]
+
+    def _fetch_summaries(self, uids: list[int]) -> list[dict]:
+        '''Fetch and summarize a specific set of UIDs in the order given.'''
+        if not uids:
+            return []
+        conn = self._imap()
+        typ, data = conn.uid("FETCH", ",".join(str(u) for u in uids), SUMMARY_ITEMS)
+        if typ != "OK":
+            raise GmailError(f"Fetch failed: {imap_response_text(data)}")
+        by_uid = {entry["uid"]: entry for entry in parse_fetch(data)}
+        return [summarize(by_uid[uid]) for uid in uids if uid in by_uid]
+
+    def search(
+        self,
+        criteria: list[str] | None = None,
+        raw: str | None = None,
+        folder: str = "inbox",
+        limit: int = 20,
+    ) -> list[dict]:
+        '''Search a folder and return message summaries, newest first.'''
+        self._select(folder, readonly=True)
+        uids = self._uid_search(criteria, raw)
+        # SEARCH returns ascending UIDs; reverse for newest-first and slice
+        # before fetching so we never pull the whole result set.
+        uids = list(reversed(uids))
+        if limit:
+            uids = uids[:limit]
+        return self._fetch_summaries(uids)
+
     def close(self) -> None:
         '''Log out of IMAP if connected.'''
         conn, self._imap_conn = self._imap_conn, None
@@ -644,6 +801,86 @@ def cmd_send(client: GmailClient, args: argparse.Namespace) -> int:
     return 0
 
 
+def render_list(messages: list[dict]) -> None:
+    '''Print message summaries as an aligned table with body snippets.'''
+    rows = []
+    for m in messages:
+        rows.append({
+            "uid": str(m["uid"]),
+            "date": m["date"],
+            "from": truncate(m["from"] or "(unknown)", 28),
+            "subject": truncate(m["subject"], 50),
+            "status": "read" if m["seen"] else "unread",
+            "snippet": m["snippet"],
+        })
+
+    uid_w = max(max(len(r["uid"]) for r in rows), len("UID"))
+    date_w = max(max(len(r["date"]) for r in rows), len("DATE"))
+    from_w = max(max(len(r["from"]) for r in rows), len("FROM"))
+    subj_w = max(max(len(r["subject"]) for r in rows), len("SUBJECT"))
+    stat_w = max(max(len(r["status"]) for r in rows), len("STATUS"))
+
+    header = (
+        f"{'UID':>{uid_w}}  {'DATE':<{date_w}}  {'FROM':<{from_w}}  "
+        f"{'SUBJECT':<{subj_w}}  {'STATUS':<{stat_w}}"
+    )
+    indent = "  "
+    print(header.rstrip())
+    print("-" * max(len(header), 2 + WRAP_WIDTH))
+    for r in rows:
+        print(
+            f"{r['uid']:>{uid_w}}  {r['date']:<{date_w}}  {r['from']:<{from_w}}  "
+            f"{r['subject']:<{subj_w}}  {r['status']:<{stat_w}}".rstrip()
+        )
+        if r["snippet"]:
+            print(textwrap.fill(
+                r["snippet"], width=2 + WRAP_WIDTH,
+                initial_indent=indent, subsequent_indent=indent,
+                max_lines=2, placeholder="...",
+            ))
+        print()
+    print(f"{len(rows)} message(s)")
+
+
+def cmd_inbox(client: GmailClient, args: argparse.Namespace) -> int:
+    '''List messages in the inbox.'''
+    criteria = build_criteria(unread=args.unread)
+    messages = client.search(criteria=criteria, folder="inbox", limit=args.limit)
+    if not messages:
+        print("No messages found")
+        return 0
+    render_list(messages)
+    return 0
+
+
+def cmd_search(client: GmailClient, args: argparse.Namespace) -> int:
+    '''Search for messages.'''
+    structured = any([args.sender, args.to, args.subject, args.unread, args.since, args.before])
+    if args.raw and structured:
+        print("Error: --raw cannot be combined with the structured search flags", file=sys.stderr)
+        return 1
+    if not args.raw and not structured:
+        print("Error: provide --raw or at least one structured search flag", file=sys.stderr)
+        return 1
+
+    criteria = None if args.raw else build_criteria(
+        sender=args.sender,
+        to=args.to,
+        subject=args.subject,
+        unread=args.unread,
+        since=args.since,
+        before=args.before,
+    )
+    messages = client.search(
+        criteria=criteria, raw=args.raw, folder=args.folder, limit=args.limit,
+    )
+    if not messages:
+        print("No messages found")
+        return 0
+    render_list(messages)
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Gmail CLI - Send emails via Gmail SMTP",
@@ -709,6 +946,66 @@ def main() -> int:
         help="Preview email without sending"
     )
 
+    # Inbox command
+    inbox_parser = subparsers.add_parser("inbox", help="List messages in the inbox")
+    inbox_parser.add_argument(
+        "--limit", "-n",
+        type=int,
+        default=20,
+        help="Maximum number of messages (default: 20)"
+    )
+    inbox_parser.add_argument(
+        "--unread",
+        action="store_true",
+        help="Show only unread messages"
+    )
+
+    # Search command
+    search_parser = subparsers.add_parser("search", help="Search for messages")
+    search_parser.add_argument(
+        "--raw", "-q",
+        help="Gmail search query, e.g. \"from:bob has:attachment newer_than:7d\""
+    )
+    search_parser.add_argument(
+        "--from", "-f",
+        dest="sender",
+        help="Match sender"
+    )
+    search_parser.add_argument(
+        "--to",
+        help="Match recipient"
+    )
+    search_parser.add_argument(
+        "--subject", "-s",
+        help="Match subject"
+    )
+    search_parser.add_argument(
+        "--unread",
+        action="store_true",
+        help="Match unread messages only"
+    )
+    search_parser.add_argument(
+        "--since",
+        metavar="YYYY-MM-DD",
+        help="Match messages on or after this date"
+    )
+    search_parser.add_argument(
+        "--before",
+        metavar="YYYY-MM-DD",
+        help="Match messages before this date"
+    )
+    search_parser.add_argument(
+        "--folder",
+        default="inbox",
+        help=f"Folder to search: {', '.join(FOLDER_ALIASES)} (default: inbox)"
+    )
+    search_parser.add_argument(
+        "--limit", "-n",
+        type=int,
+        default=20,
+        help="Maximum number of messages (default: 20)"
+    )
+
     args = parser.parse_args()
 
     if not args.command:
@@ -731,13 +1028,22 @@ def main() -> int:
         return 1
 
     # Create client and run command
-    client = GmailClient(user, password)
-
-    if args.command == "send":
-        return cmd_send(client, args)
-    else:
+    commands = {
+        "send": cmd_send,
+        "inbox": cmd_inbox,
+        "search": cmd_search,
+    }
+    handler = commands.get(args.command)
+    if handler is None:
         parser.print_help()
         return 1
+
+    with GmailClient(user, password) as client:
+        try:
+            return handler(client, args)
+        except GmailError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
 
 
 if __name__ == "__main__":
