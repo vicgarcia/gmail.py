@@ -4,24 +4,55 @@
 # dependencies = []
 # ///
 
-# Remove current directory from path to avoid shadowing stdlib email module
+# Remove current directory from path to avoid shadowing stdlib email module.
+# The project directory is itself named "gmail.py", so a bare `import email`
+# would resolve to this repo rather than the stdlib. Several modules are pulled
+# in below (email.parser, email.policy, email.header, email.utils) and every one
+# of them would break. Do not remove or reorder this block.
 import sys
 from pathlib import Path as _Path
 _script_dir = str(_Path(__file__).parent.resolve())
 sys.path = [p for p in sys.path if p not in ("", ".", _script_dir)]
 
 import argparse
+import email.utils
+import imaplib
 import os
+import re
 import smtplib
+import textwrap
+from datetime import datetime
+from email import encoders
+from email import policy
+from email.header import decode_header, make_header
 from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from email import encoders
+from email.parser import BytesParser
+from html.parser import HTMLParser
 from pathlib import Path
 
 
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 465
+IMAP_HOST = "imap.gmail.com"
+IMAP_PORT = 993
+
+# Folder aliases map to IMAP special-use flags rather than names, because the
+# real names are localized per account ("[Gmail]/All Mail" in English) and must
+# be discovered from the LIST response.
+FOLDER_FLAGS = {
+    "sent": "\\Sent",
+    "all": "\\All",
+    "trash": "\\Trash",
+    "drafts": "\\Drafts",
+    "spam": "\\Junk",
+}
+FOLDER_ALIASES = ["inbox"] + list(FOLDER_FLAGS)
+SPECIAL_USE_FLAGS = {flag.lower() for flag in FOLDER_FLAGS.values()} | {"\\important", "\\flagged"}
+
+BODY_TRUNCATE = 4000
+WRAP_WIDTH = 92
 
 CLI_EPILOG = '''\
 Examples:
@@ -46,12 +77,266 @@ class GmailError(Exception):
     pass
 
 
+class _TextExtractor(HTMLParser):
+    '''Collapse HTML into readable plain text using only the stdlib.'''
+
+    SKIP_TAGS = {"script", "style", "head", "title"}
+    BLOCK_TAGS = {
+        "p", "div", "br", "tr", "table", "blockquote", "ul", "ol", "pre",
+        "h1", "h2", "h3", "h4", "h5", "h6", "hr", "section", "article",
+    }
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.chunks: list[str] = []
+        self.skipping = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.SKIP_TAGS:
+            self.skipping += 1
+        elif tag == "li":
+            self.chunks.append("\n- ")
+        elif tag in self.BLOCK_TAGS:
+            self.chunks.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in self.SKIP_TAGS and self.skipping:
+            self.skipping -= 1
+        elif tag != "li" and tag in self.BLOCK_TAGS:
+            self.chunks.append("\n")
+
+    def handle_data(self, data):
+        if not self.skipping:
+            self.chunks.append(data)
+
+    def text(self) -> str:
+        raw = "".join(self.chunks)
+        # Collapse runs of spaces within lines, and runs of blank lines
+        lines = [re.sub(r"[ \t\xa0]+", " ", ln).strip() for ln in raw.splitlines()]
+        out: list[str] = []
+        for line in lines:
+            if line or (out and out[-1]):
+                out.append(line)
+        return "\n".join(out).strip()
+
+
+def html_to_text(html: str) -> str:
+    '''Render an HTML body as readable plain text.'''
+    parser = _TextExtractor()
+    try:
+        parser.feed(html)
+        parser.close()
+    except Exception:
+        pass
+    return parser.text()
+
+
+def decode_header_value(raw: str | None) -> str:
+    '''Decode an RFC 2047 encoded header into a readable string.'''
+    if not raw:
+        return ""
+    try:
+        return str(make_header(decode_header(raw))).strip()
+    except Exception:
+        return str(raw).strip()
+
+
+def format_address(raw: str | None, name_only: bool = False) -> str:
+    '''Format an address header as a readable display string.'''
+    if not raw:
+        return ""
+    parts = []
+    for name, addr in email.utils.getaddresses([decode_header_value(raw)]):
+        name = decode_header_value(name)
+        if name_only:
+            parts.append(name or addr)
+        elif name and addr:
+            parts.append(f"{name} <{addr}>")
+        else:
+            parts.append(name or addr)
+    return ", ".join(p for p in parts if p)
+
+
+def address_list(raw: str | None) -> list[str]:
+    '''Return the bare email addresses in an address header.'''
+    if not raw:
+        return []
+    return [a for _, a in email.utils.getaddresses([decode_header_value(raw)]) if a]
+
+
+def format_date(raw: str | None, fmt: str = "%b %d %H:%M") -> str:
+    '''Format a Date header for display, falling back to the raw value.'''
+    if not raw:
+        return ""
+    try:
+        dt = email.utils.parsedate_to_datetime(raw)
+    except Exception:
+        return raw.strip()
+    if dt is None:
+        return raw.strip()
+    if dt.tzinfo is not None:
+        dt = dt.astimezone()
+    return dt.strftime(fmt)
+
+
+def decode_part(part) -> str:
+    '''Decode a MIME part payload to text, honoring its declared charset.'''
+    payload = part.get_payload(decode=True)
+    if payload is None:
+        return ""
+    charset = part.get_content_charset() or "utf-8"
+    try:
+        return payload.decode(charset, errors="replace")
+    except LookupError:
+        return payload.decode("utf-8", errors="replace")
+
+
+def is_attachment(part) -> bool:
+    '''True when a MIME part is an attachment rather than body content.'''
+    disposition = (part.get("Content-Disposition") or "").lower()
+    if disposition.startswith("attachment"):
+        return True
+    return bool(part.get_filename())
+
+
+def extract_bodies(msg) -> tuple[str, str]:
+    '''Walk a message and return its (plain text, html) bodies.'''
+    text = ""
+    html = ""
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.get_content_maintype() == "multipart" or is_attachment(part):
+                continue
+            ctype = part.get_content_type()
+            if ctype == "text/plain" and not text:
+                text = decode_part(part)
+            elif ctype == "text/html" and not html:
+                html = decode_part(part)
+    else:
+        if msg.get_content_type() == "text/html":
+            html = decode_part(msg)
+        else:
+            text = decode_part(msg)
+    return text, html
+
+
+def message_text(msg) -> str:
+    '''Best-effort readable body: prefer text/plain, fall back to html.'''
+    text, html = extract_bodies(msg)
+    if text.strip():
+        return text
+    if html.strip():
+        return html_to_text(html)
+    return ""
+
+
+def list_attachments(msg) -> list[dict]:
+    '''Return the attachment manifest for a message.'''
+    attachments = []
+    if not msg.is_multipart():
+        return attachments
+    for part in msg.walk():
+        if part.get_content_maintype() == "multipart" or not is_attachment(part):
+            continue
+        payload = part.get_payload(decode=True) or b""
+        attachments.append({
+            "filename": decode_header_value(part.get_filename()) or "(unnamed)",
+            "content_type": part.get_content_type(),
+            "size": len(payload),
+        })
+    return attachments
+
+
+def format_size(size: int) -> str:
+    '''Format a byte count for display.'''
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size / (1024 * 1024):.1f} MB"
+
+
+def quote_folder(name: str) -> str:
+    '''Quote a mailbox name for SELECT; names with spaces fail unquoted.'''
+    return '"' + name.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+LIST_RE = re.compile(r'^\((?P<flags>[^)]*)\)\s+(?P<delim>"[^"]*"|NIL)\s+(?P<name>.*)$')
+
+
+def parse_list_line(line: str) -> tuple[list[str], str] | None:
+    '''Parse one LIST response line into (flags, mailbox name).'''
+    match = LIST_RE.match(line.strip())
+    if not match:
+        return None
+    flags = match.group("flags").split()
+    name = match.group("name").strip()
+    if name.startswith('"') and name.endswith('"'):
+        name = name[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+    return flags, name
+
+
+def folder_alias(name: str, flags_map: dict, names: list) -> str:
+    '''Resolve a folder alias to the real mailbox name discovered via LIST.'''
+    key = (name or "inbox").strip()
+    lower = key.lower()
+    if lower == "inbox":
+        return "INBOX"
+    if lower in FOLDER_FLAGS:
+        real = flags_map.get(FOLDER_FLAGS[lower].lower())
+        if not real:
+            raise GmailError(f"No {lower} folder found on this account")
+        return real
+    # Accept a literal mailbox name as long as the account actually has it
+    for candidate in names:
+        if candidate.lower() == lower:
+            return candidate
+    raise GmailError(
+        f"Unknown folder {name!r} (use one of: {', '.join(FOLDER_ALIASES)}, "
+        "or an exact mailbox name)"
+    )
+
+
+def imap_error_text(err: Exception) -> str:
+    '''Readable text for an imaplib error, whose args are often bytes.'''
+    parts = []
+    for arg in getattr(err, "args", ()):
+        if isinstance(arg, bytes):
+            parts.append(arg.decode(errors="replace"))
+        else:
+            parts.append(str(arg))
+    return " ".join(parts) or str(err)
+
+
+def imap_response_text(data) -> str:
+    '''Readable text for an imaplib response payload.'''
+    parts = []
+    for item in data or []:
+        if isinstance(item, bytes):
+            parts.append(item.decode(errors="replace"))
+        elif isinstance(item, tuple):
+            parts.append(" ".join(
+                x.decode(errors="replace") if isinstance(x, bytes) else str(x) for x in item
+            ))
+        else:
+            parts.append(str(item))
+    return " ".join(parts)
+
+
 class GmailClient:
-    '''SMTP client for sending emails via Gmail.'''
+    '''Gmail client carrying both transports: SMTP for sending, IMAP for reading.
+
+    Both connect lazily. They live on one object because `reply` needs to read
+    a message and send a new one within a single invocation.
+    '''
 
     def __init__(self, user: str, app_password: str):
         self.user = user
         self.app_password = app_password
+        self._imap_conn = None
+        self._capabilities: set[str] = set()
+        self._folder_flags: dict | None = None
+        self._folder_names: list = []
 
     def send(
         self,
@@ -158,6 +443,104 @@ class GmailClient:
             f"attachment; filename=\"{file_path.name}\""
         )
         msg.attach(part)
+
+    # ── IMAP ──────────────────────────────────────────────────────────────────
+
+    def _imap(self) -> imaplib.IMAP4_SSL:
+        '''Connect and authenticate to IMAP, caching the connection.'''
+        if self._imap_conn is not None:
+            return self._imap_conn
+
+        try:
+            conn = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
+        except OSError as e:
+            raise GmailError(f"IMAP connection failed: {e}")
+
+        try:
+            conn.login(self.user, self.app_password)
+        except imaplib.IMAP4.error as e:
+            detail = imap_error_text(e)
+            upper = detail.upper()
+            if "AUTHENTICATIONFAILED" in upper or "INVALID CREDENTIALS" in upper:
+                raise GmailError(
+                    "IMAP authentication failed. Check GMAIL_USER and GMAIL_APP_PASSWORD, "
+                    "and confirm IMAP is enabled in Gmail settings "
+                    "(Settings > Forwarding and POP/IMAP > Enable IMAP)."
+                )
+            if "IMAP ACCESS IS DISABLED" in upper or "IMAP IS DISABLED" in upper:
+                raise GmailError(
+                    "IMAP is disabled for this account. Enable it in Gmail settings "
+                    "(Settings > Forwarding and POP/IMAP > Enable IMAP)."
+                )
+            raise GmailError(f"IMAP login failed: {detail}")
+
+        # imaplib caches the pre-auth greeting, which under-reports Gmail's
+        # capabilities (it claims MOVE and UIDPLUS are absent). Re-query now
+        # that we are authenticated.
+        typ, data = conn.capability()
+        if typ == "OK" and data:
+            self._capabilities = set(data[0].decode(errors="replace").upper().split())
+
+        self._imap_conn = conn
+        return conn
+
+    def _folders(self) -> tuple[dict, list]:
+        '''LIST all mailboxes once; return (special-use flag -> name, all names).'''
+        if self._folder_flags is not None:
+            return self._folder_flags, self._folder_names
+
+        conn = self._imap()
+        typ, data = conn.list()
+        if typ != "OK":
+            raise GmailError("Could not list mailboxes")
+
+        flags_map: dict[str, str] = {}
+        names: list[str] = []
+        for line in data or []:
+            if isinstance(line, tuple):
+                line = b" ".join(part for part in line if isinstance(part, bytes))
+            parsed = parse_list_line(line.decode(errors="replace"))
+            if not parsed:
+                continue
+            flags, name = parsed
+            names.append(name)
+            # Keyed lowercase: Gmail's capitalization of special-use flags is
+            # not guaranteed, and neither is the mailbox name.
+            for flag in flags:
+                if flag.lower() in SPECIAL_USE_FLAGS:
+                    flags_map[flag.lower()] = name
+
+        self._folder_flags = flags_map
+        self._folder_names = names
+        return flags_map, names
+
+    def _select(self, folder: str = "inbox", readonly: bool = True) -> str:
+        '''Resolve a folder alias, SELECT it, and return the real mailbox name.'''
+        flags_map, names = self._folders()
+        name = folder_alias(folder, flags_map, names)
+        conn = self._imap()
+        typ, data = conn.select(quote_folder(name), readonly=readonly)
+        if typ != "OK":
+            raise GmailError(f"Could not open folder {name!r}: {imap_response_text(data)}")
+        return name
+
+    def close(self) -> None:
+        '''Log out of IMAP if connected.'''
+        conn, self._imap_conn = self._imap_conn, None
+        if conn is None:
+            return
+        try:
+            if conn.state == "SELECTED":
+                conn.close()
+            conn.logout()
+        except Exception:
+            pass
+
+    def __enter__(self) -> "GmailClient":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
 
 
 def parse_recipients(value: str) -> list[str]:
