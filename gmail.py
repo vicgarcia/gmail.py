@@ -68,6 +68,8 @@ Examples:
   gmail.py read 4821
   gmail.py read 4821 --full --save-attachments ./downloads
   gmail.py thread 4821
+  gmail.py mark 4821 --read
+  gmail.py mark 4821 --archive
 
 Setup:
   1. Enable 2-Step Verification on your Google account
@@ -377,6 +379,27 @@ def parse_fetch(data) -> list[dict]:
             "raw": raw,
         })
     return messages
+
+
+def parse_fetch_meta(data) -> list[dict]:
+    '''Parse a bodyless FETCH response (flags and Gmail ids only).'''
+    entries = []
+    for line in data or []:
+        if isinstance(line, tuple):
+            line = b" ".join(part for part in line if isinstance(part, bytes))
+        if not isinstance(line, bytes):
+            continue
+        uid = FETCH_UID_RE.search(line)
+        if not uid:
+            continue
+        flags = FETCH_FLAGS_RE.search(line)
+        msgid = FETCH_MSGID_RE.search(line)
+        entries.append({
+            "uid": int(uid.group(1)),
+            "flags": flags.group(1).decode(errors="replace").split() if flags else [],
+            "msgid": msgid.group(1).decode() if msgid else None,
+        })
+    return entries
 
 
 def snippet_of(msg, width: int = 240) -> str:
@@ -714,6 +737,81 @@ class GmailClient:
             message["folder"] = "all"
         return messages or [base]
 
+    def _fetch_meta(self, uid: int) -> dict:
+        '''Fetch flags and Gmail message id for a UID in the selected folder.'''
+        conn = self._imap()
+        typ, data = conn.uid("FETCH", str(uid), "(UID FLAGS X-GM-MSGID)")
+        if typ != "OK":
+            raise GmailError(f"Fetch failed: {imap_response_text(data)}")
+        entries = parse_fetch_meta(data)
+        return entries[0] if entries else {}
+
+    def _find_by_msgid(self, msgid: str, folder: str) -> int | None:
+        '''Locate a message in a folder by its X-GM-MSGID; UIDs are per-folder.'''
+        self._select(folder, readonly=True)
+        conn = self._imap()
+        typ, data = conn.uid("SEARCH", None, "X-GM-MSGID", msgid)
+        if typ != "OK":
+            return None
+        uids = [int(u) for u in (data[0] or b"").split()]
+        return uids[-1] if uids else None
+
+    def mark(self, uid: int, action: str, folder: str = "inbox") -> dict:
+        '''Apply a mark action and report the state observed afterwards.
+
+        Gmail returns OK for operations that do nothing (removing the \\Inbox
+        label, for one), so nothing here trusts a response code: every mutation
+        is followed by a re-query of the message's real flags and folder.
+        '''
+        source = self._select(folder, readonly=False)
+        conn = self._imap()
+
+        before = self._fetch_meta(uid)
+        if not before:
+            raise GmailError(f"No message with UID {uid} in folder {folder!r}")
+        msgid = before["msgid"]
+
+        result = {
+            "action": action,
+            "uid": uid,
+            "folder": folder,
+            "source": source,
+            "was_seen": "\\Seen" in before["flags"],
+        }
+
+        if action in ("read", "unread"):
+            operation = "+FLAGS" if action == "read" else "-FLAGS"
+            typ, data = conn.uid("STORE", str(uid), operation, "(\\Seen)")
+            if typ != "OK":
+                raise GmailError(f"Store failed: {imap_response_text(data)}")
+            after = self._fetch_meta(uid)
+            result["seen"] = "\\Seen" in after.get("flags", [])
+            result["new_uid"] = uid
+            result["new_folder"] = folder
+            return result
+
+        # Archive and trash are moves. Removing the \\Inbox label via
+        # X-GM-LABELS returns OK and does nothing, so UID MOVE is the only
+        # mechanism that actually works.
+        target = "all" if action == "archive" else "trash"
+        target_name = folder_alias(target, *self._folders())
+        typ, data = conn.uid("MOVE", str(uid), quote_folder(target_name))
+        if typ != "OK":
+            raise GmailError(f"Move failed: {imap_response_text(data)}")
+
+        # Verify: gone from the source folder, present in the target
+        result["in_source"] = self._find_by_msgid(msgid, folder) is not None if msgid else None
+        new_uid = self._find_by_msgid(msgid, target) if msgid else None
+        result["new_uid"] = new_uid
+        result["new_folder"] = target
+        result["target_name"] = target_name
+        if new_uid is not None:
+            after = self._fetch_meta(new_uid)
+            result["seen"] = "\\Seen" in after.get("flags", [])
+        else:
+            result["seen"] = result["was_seen"]
+        return result
+
     def close(self) -> None:
         '''Log out of IMAP if connected.'''
         conn, self._imap_conn = self._imap_conn, None
@@ -1035,6 +1133,55 @@ def cmd_thread(client: GmailClient, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_mark(client: GmailClient, args: argparse.Namespace) -> int:
+    '''Mark a message read, unread, archived, or trashed.'''
+    actions = [name for name in ("read", "unread", "archive", "trash") if getattr(args, name)]
+    if len(actions) != 1:
+        print("Error: exactly one of --read, --unread, --archive, --trash is required", file=sys.stderr)
+        return 1
+    action = actions[0]
+
+    result = client.mark(args.uid, action, folder=args.folder)
+
+    headline = {
+        "read": "Marked as read",
+        "unread": "Marked as unread",
+        "archive": "Archived",
+        "trash": "Moved to trash",
+    }[action]
+    print(headline)
+
+    fields = [("UID", str(result["uid"])), ("Folder", result["folder"])]
+    if action in ("archive", "trash"):
+        fields.append(("Moved to", f"{result['new_folder']} ({result['target_name']})"))
+        if result["new_uid"] is not None:
+            fields.append(("New UID", str(result["new_uid"])))
+        fields.append(("Still in source", "yes" if result["in_source"] else "no"))
+    fields.append(("Status", "read" if result["seen"] else "unread"))
+
+    label_w = max(len(f[0]) for f in fields)
+    for label, value in fields:
+        print(f"  {label:<{label_w}}  {value}")
+
+    # Report on what was observed, not on what the server claimed
+    if action in ("archive", "trash"):
+        if result["new_uid"] is None:
+            print()
+            print("Warning: could not confirm the message in the destination folder", file=sys.stderr)
+            return 1
+        if result["in_source"]:
+            print()
+            print("Warning: the message is still present in the source folder", file=sys.stderr)
+            return 1
+    else:
+        expected = action == "read"
+        if result["seen"] != expected:
+            print()
+            print("Warning: the flag did not change", file=sys.stderr)
+            return 1
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Gmail CLI - Send emails via Gmail SMTP",
@@ -1198,6 +1345,20 @@ def main() -> int:
         help="Show full bodies without truncation"
     )
 
+    # Mark command
+    mark_parser = subparsers.add_parser("mark", help="Mark a message read, unread, archived, or trashed")
+    mark_parser.add_argument("uid", type=int, help="Message UID (from inbox or search)")
+    mark_parser.add_argument(
+        "--folder",
+        default="inbox",
+        help=f"Folder holding the message: {', '.join(FOLDER_ALIASES)} (default: inbox)"
+    )
+    mark_group = mark_parser.add_mutually_exclusive_group(required=True)
+    mark_group.add_argument("--read", action="store_true", help="Mark as read")
+    mark_group.add_argument("--unread", action="store_true", help="Mark as unread")
+    mark_group.add_argument("--archive", action="store_true", help="Archive (move out of the inbox)")
+    mark_group.add_argument("--trash", action="store_true", help="Move to trash (destructive)")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1226,6 +1387,7 @@ def main() -> int:
         "search": cmd_search,
         "read": cmd_read,
         "thread": cmd_thread,
+        "mark": cmd_mark,
     }
     handler = commands.get(args.command)
     if handler is None:
